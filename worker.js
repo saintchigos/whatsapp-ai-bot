@@ -25,44 +25,47 @@ const PERSONA_DEFAULT =
   "Your name is Tino. You are replying to WhatsApp messages for yourself — " +
   "you ARE Tino, not an assistant. Text exactly like Tino: pretty normal, " +
   "casual, short messages, no robot phrasing.\n" +
-  "- Your humor is dark and dry: you drop sarcastic, slightly morbid jokes " +
-  "with people you trust, but you stay friendly and never mean-spirited. " +
-  "You laugh at life's small misfortunes (e.g. 'lol another day of " +
-  "suffering'). Keep dark humor light, not depressing.\n" +
-  "- You care a lot about how people see you, so you keep a cool, smart, " +
-  "confident tone and don't overshare or beg for attention. You value " +
-  "yourself and your time.\n" +
+  "- You're easygoing and warm: friendly, kind and easy to talk to. You make " +
+  "people feel good about themselves. You can joke around lightly, but you " +
+  "never insult, mock or go cold on anyone - even for laughs.\n" +
   "- You're sharp and proud of how smart you are: quick with clever replies, " +
   "comfortable talking about ideas, science, tech or money.\n" +
   "- You have strong faith in God; mention it naturally when the topic is " +
   "about hope, struggle, plans or tough times.\n" +
   "- You love your laptop and gadgets and happily nerd out about devices, " +
   "phones and tech problems.\n" +
+  "- You're respectful, especially with elders or people you look up to. " +
+  "Match the warmth and respect of the relationship.\n" +
   "- Speak the language the person writes back in: English, Sesotho or " +
-  "Shona — match their language exactly.\n" +
+  "Shona - match their language exactly.\n" +
   "- You understand slang like a local: English slang (fr, ngl, lowkey, " +
   "deadass, bet, cap, no cap, ong, wym, idk, ykwim, gtg, idc) and southern " +
   "African township slang (howzit, heita, shap, bru, bra, kasi, vibes, " +
   "eish, majita, chommie, my bru). Decode the vibe mentally and answer " +
   "back in the same slang register.\n" +
   "- When replying in Sesotho or Shona, only write words you KNOW are " +
-  "correct — a short correct sentence beats a long guessed one. Never " +
+  "correct - a short correct sentence beats a long guessed one. Never " +
   "stitch English words into Sesotho or Shona sentences.\n" +
   "- Keep replies to 1-2 sentences, normal texting style (lol, sike, nah, " +
   "ok that's crazy, let me think...), relaxed and confident. Sometimes ask " +
   "a question back so the chat flows.\n" +
   "- Never say you are an AI, a bot or an assistant. Never be formal, " +
   "preachy or overly helpful. If you don't know something just say you're " +
-  "not sure. Sound like a real friend, not a business.";
-
-const CLAUDE_HOLD = "haha sorry, my phone froze, one sec lol";
+  "not sure. Sound like a real friend, not a business.\n" +
+  "- Never be rude, sarcastic at someone's expense, dismissive or cold. If " +
+  "someone is annoying, frustrated or dramatic, stay calm, kind and a " +
+  "little playful.";
 
 const MAX_HISTORY = 20;
-const SWEEP_LIMIT = 30;
 const MAX_PROMPT_CHARS = 2400;
 const AI_BURST_MAX = 14;           // AI replies per minute, global cap
 const CONTACT_TTL_MS = 86400000;   // 24h contact cache
 const DEDUPE_TTL_SEC = 604800;     // 7 days
+const BOT_WID = "26662848760@c.us";
+const SWEEP_LOOKBACK_MS = 14 * 3600 * 1000; // only catch messages this old
+const SWEEP_MAX_CONTACTS = 40;     // contacts probed per recovery run
+const SWEEP_MAX_REPLIES = 3;       // replies sent per recovery run
+const SWEEP_COOLDOWN_SEC = 600;    // min gap between recovery runs (cron 10min)
 
 const SHONA_MARKERS = [
   "mhoro", "mhoroi", "wakadii", "makadini", "zviri", "zvipi", "zvakanaka",
@@ -96,43 +99,22 @@ const LANG_DIRECTIVE = {
   st: "\nLANGUAGE RULE: The person wrote in SESOTHO (Lesotho). Reply in correct, natural Sesotho the way a Mosotho texts: \"dumela, u phela joang?\", \"ke teng, wena u joang?\", \"ho etsahalang?\", \"ke phela hantle\", \"ho lokile\", \"kea leboha\". \"Joang\" is always spelled with an o (never \"jwang\"). Keep replies short and relaxed. Do not mix English words into Sesotho.",
 };
 
-const CANNED_REPLY = {
-  sn: [
-    "ndiri po, zvakanaka. iwe uri sei?",
-    "hevo! ndiri pano, wakadii?",
-    "zviri sei? ndiri zvakanaka fela",
-    "mhoro we, ndiri po. wena uri sei?",
-  ],
-  st: [
-    "ke teng, ho lokile. wena u ntse joang?",
-    "heita! ke phela hantle, wena u joang?",
-    "shap, ke lokile. u tsoile joang?",
-    "dumela, ke teng mona. wena u phela joang?",
-  ],
-};
-
-const HOLD_MSG = {
-  sn: "sori, foni yangu yaoma, one sec",
-  st: "sorri, founu yaka e ngametse, one sec",
-};
+const HOLD_MSG = "haha wait my fone glitched, say that again lol";
 
 const BURST_MSG = {
-  en: "haha aight aight, one at a time 😂",
-  sn: "haha shuwa, one at a time 😂",
-  st: "haha, thola hanyane 😂",
+  en: "eish, one at a time 😂",
+  sn: "shuwa, one at a time 😂",
+  st: "thola hanyane 😂",
 };
 
 const MICRO_EN = [
-  "aight bet",
-  "lol cool",
-  "np bro",
-  "haha yeah",
+  "lol",
+  "aha",
+  "ngyakutha",
   "yo",
-  "cool cool",
-  "no worries",
 ];
-const MICRO_ST = ["ho lokile", "shap!", "heita", "kea utloa"];
-const MICRO_SN = ["zvakanaka", "hevo!", "shuwa"];
+const MICRO_ST = ["heita!", "ok", "leboha!"];
+const MICRO_SN = ["hevo!", "ndatenda!", "ok"];
 
 const STICKER_ACK = [
   "lol nice sticker",
@@ -180,17 +162,33 @@ function loadHistory(raw) {
   }
 }
 
-function cannedReply(lang) {
-  const list = CANNED_REPLY[lang];
-  return list ? pick(list) : null;
+function lastAssistantText(history) {
+  for (let i = (history || []).length - 1; i >= 0; i--) {
+    if (history[i].role === "assistant" && history[i].text) return history[i].text;
+  }
+  return "";
 }
 
-function holdMessage(lang) {
-  return (lang && HOLD_MSG[lang]) || CLAUDE_HOLD;
+function holdMessage() {
+  return HOLD_MSG;
 }
 
 function burstMessage(lang) {
   return (lang && BURST_MSG[lang]) || BURST_MSG.en;
+}
+
+function extractText(messageData) {
+  const raw = messageData || {};
+  const td = raw.textMessageData || {};
+  if (td.textMessage) return String(td.textMessage).trim();
+  const ext = raw.extendedTextMessage || td.extendedTextMessage || {};
+  if (ext.text) return String(ext.text).trim();
+  const q = raw.quotedMessage || {};
+  if (q.textMessage) return String(q.textMessage).trim();
+  if (q.extendedTextMessage && q.extendedTextMessage.text) {
+    return String(q.extendedTextMessage.text).trim();
+  }
+  return "";
 }
 
 // ---------- AI ----------
@@ -214,9 +212,9 @@ function buildPrompt(persona, history, lang, who) {
 
 function retrySeconds(resp, errText) {
   const h = resp.headers.get("retry-after");
-  if (h && /^[0-9.]+$/.test(h)) return Math.min(parseFloat(h), 4);
+  if (h && /^[0-9.]+$/.test(h)) return Math.min(parseFloat(h), 3);
   const m = errText.match(/retry\s+in\s+(\d+(?:\.\d+)?)\s*s?/i);
-  if (m) return Math.min(parseFloat(m[1]), 4);
+  if (m) return Math.min(parseFloat(m[1]), 3);
   return 1;
 }
 
@@ -236,8 +234,8 @@ async function askGemini(prompt, key, model) {
   };
 
   let waited = 0;
-  for (let attempt = 0; attempt < 4; attempt++) {
-    if (waited > 15) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (waited > 6) {
       console.log("GEMINI_TIMEOUT wait budget");
       return null;
     }
@@ -254,8 +252,8 @@ async function askGemini(prompt, key, model) {
 
     if (resp.status === 429 || resp.status === 503) {
       const errText = await resp.text().catch(() => "");
-      if (attempt < 3) {
-        const wait = retrySeconds(resp, errText);
+      if (attempt < 2) {
+        const wait = Math.min(retrySeconds(resp, errText), 3);
         waited += wait;
         console.log("GEMINI_RETRY", resp.status, "wait", wait, "attempt", attempt + 1);
         await sleep(wait * 1000);
@@ -296,13 +294,9 @@ async function askCloudflare(prompt, env) {
   }
 }
 
-async function replyChain(prompt, env, lang) {
+async function replyChain(prompt, env) {
   const gemini = await askGemini(prompt, env.GEMINI_KEY, env.GEMINI_MODEL);
   if (gemini) return { text: gemini, brain: "gemini" };
-  if (lang === "sn" || lang === "st") {
-    const canned = cannedReply(lang);
-    if (canned) return { text: canned, brain: "canned" };
-  }
   const cf = await askCloudflare(prompt, env);
   if (cf) return { text: cf, brain: "cloudflare" };
   return null;
@@ -437,8 +431,8 @@ async function fetchContactIfNew(env, chatId, historyLen) {
 // ---------- media / micro handling ----------
 
 const MICRO_PATTERN = [
-  /^(ok|okk|okay|oke|okei|k|kk|kkk|sure|yep|yup|yaas|yea|yeah|yepyep|fine|alright|aight|ight|dope|nice|cool|sweet|noted|lol|lmao|lool|loool|haha+|hehe+|hmm+|mm+|oh+|ooh+|pff+|koe|kool|bet|good|great|gw|gj)$/i,
-  /^(thx|ty|tysm|tnx|thanks|thank\s*you|thanku|dankie|kea\s*leboha|leboha|ndatenda|tenda|waita)$/i,
+  /^(ok|lol|lmao|haha|hehe|aha|yo)$/i,
+  /^(thx|ty|thanks|thanku|dankie|leboha|ndatenda|tenda|waita)$/i,
   /^[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}]+$/u,
 ];
 
@@ -478,49 +472,143 @@ async function sendGreenApi(chatId, message, id, token) {
   return resp.status === 200;
 }
 
-// ---------- catch-up sweep ----------
+// ---------- contact-based recovery (catches missed webhooks) ----------
 
-async function sweepUnreplied(env, persona) {
-  let scanned = 0;
-  let cursor;
-  let found = 0;
-  while (scanned < SWEEP_LIMIT) {
-    const page = await env.CHAT_RECORDS.list({ limit: 100, cursor });
-    for (const k of page.keys || []) {
-      if (scanned++ >= SWEEP_LIMIT) break;
-      if (!k.name.startsWith("chat:")) continue;
-      const history = loadHistory(await env.CHAT_RECORDS.get(k.name));
-      if (!history.length) continue;
-      const last = history[history.length - 1];
-      if (last.role !== "user") continue;
-      found++;
-      const chatId = k.name.slice(5);
-      const lang = detectLang(last.text);
-      let who = null;
-      try {
-        const rawC = await env.CHAT_RECORDS.get("cnt:" + chatId);
-        if (rawC) {
-          const c = JSON.parse(rawC);
-          who = c.contactName || c.profileName || null;
-        }
-      } catch {}
-      const result = await replyChain(buildPrompt(persona, history, lang, who), env, lang);
-      if (!result) {
-        console.log("SWEEP_SKIP", chatId, "still busy");
-        continue;
-      }
-      const sent = await sendGreenApi(chatId, result.text, env.GREEN_ID, env.GREEN_TOKEN);
-      console.log("SWEEP_REPLY", chatId, result.brain, sent);
-      if (sent) {
-        history.push({ role: "assistant", text: result.text, ts: Date.now() });
-        await env.CHAT_RECORDS.put(k.name, JSON.stringify(history.slice(-MAX_HISTORY)));
-      }
+async function getGreenContacts(id, token) {
+  try {
+    const resp = await fetch(
+      `https://api.green-api.com/waInstance${id}/getContacts/${token}`,
+      { method: "GET" },
+    );
+    if (!resp.ok) {
+      console.log("CONTACTS_FAIL", resp.status);
+      return [];
     }
-    if (page.list_complete && !page.cursor) break;
-    cursor = page.cursor;
-    if (!cursor) break;
+    const arr = await resp.json().catch(() => []);
+    return Array.isArray(arr) ? arr : [];
+  } catch (err) {
+    console.log("CONTACTS_ERR", String(err));
+    return [];
   }
-  console.log("SWEEP_DONE scanned", scanned, "unreplied", found);
+}
+
+async function pullChatHistory(chatId, count, id, token) {
+  try {
+    const resp = await fetch(
+      `https://api.green-api.com/waInstance${id}/getChatHistory/${token}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chatId, count }),
+      },
+    );
+    if (!resp.ok) {
+      console.log("HISTORY_FAIL", chatId, resp.status);
+      return [];
+    }
+    const arr = await resp.json().catch(() => []);
+    return Array.isArray(arr) ? arr : [];
+  } catch (err) {
+    console.log("HISTORY_ERR", String(err));
+    return [];
+  }
+}
+
+async function recoverMissed(env, persona) {
+  const now = Date.now();
+  const lastCd = await env.CHAT_RECORDS.get("c:sweep").catch(() => null);
+  if (lastCd && now - parseInt(lastCd, 10) < SWEEP_COOLDOWN_SEC * 1000) {
+    return;
+  }
+  await env.CHAT_RECORDS.put("c:sweep", String(now), { expirationTtl: 700 });
+
+  const minute = Math.floor(Date.now() / 60000);
+  const used = parseInt((await env.CHAT_RECORDS.get("rate:m:" + minute)) || "0", 10) || 0;
+  if (used >= 7) {
+    console.log("RECOVER_SKIP_BUDGET", used);
+    return;
+  }
+
+  const contacts = await getGreenContacts(env.GREEN_ID, env.GREEN_TOKEN);
+  const targets = (contacts || [])
+    .map((c) => c && c.id)
+    .filter(
+      (id) =>
+        id &&
+        id.endsWith("@c.us") &&
+        id !== BOT_WID &&
+        id !== "0@c.us" &&
+        !id.startsWith("0@"),
+    );
+  if (!targets.length) {
+    console.log("SWEEP_NONE");
+    return;
+  }
+
+  let checked = 0;
+  let replies = 0;
+  for (const chatId of targets) {
+    if (checked >= SWEEP_MAX_CONTACTS || replies >= SWEEP_MAX_REPLIES) break;
+    checked++;
+
+    const hist = loadHistory(await env.CHAT_RECORDS.get("chat:" + chatId));
+    const last = hist[hist.length - 1];
+    if (last && last.role === "assistant" && now - (last.ts || 0) < 12 * 3600 * 1000) {
+      continue;
+    }
+
+    const msgs = await pullChatHistory(chatId, 3, env.GREEN_ID, env.GREEN_TOKEN);
+    let missed = null;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i];
+      if (!m || m.type !== "incoming" || m.senderId !== chatId) continue;
+      const ts = (m.timestamp || 0) * 1000;
+      if (now - ts > SWEEP_LOOKBACK_MS) continue;
+      const dup = await env.CHAT_RECORDS.get("d:" + chatId).catch(() => null);
+      if (dup === (m.idMessage || "")) continue;
+      const text = extractText(m);
+      if (!text) continue;
+      missed = { m, text, ts };
+    }
+    if (!missed) continue;
+    if (replies >= SWEEP_MAX_REPLIES) break;
+    replies++;
+
+    console.log("SWEEP_FOUND", chatId, "-", missed.text.slice(0, 60));
+    const lang = detectLang(missed.text);
+    let who = null;
+    try {
+      const rc = JSON.parse((await env.CHAT_RECORDS.get("cnt:" + chatId)) || "null");
+      who = (rc && (rc.contactName || rc.profileName)) || null;
+    } catch {}
+
+    const h2 = loadHistory(await env.CHAT_RECORDS.get("chat:" + chatId));
+    if (!h2.length) {
+      await fetchContactIfNew(env, chatId, 0);
+    }
+    h2.push({ role: "user", text: missed.text, ts: missed.ts });
+    const result = await replyChain(
+      buildPrompt(persona, h2, lang, who),
+      env,
+    );
+    if (result) {
+      const sent = await sendGreenApi(
+        chatId,
+        result.text,
+        env.GREEN_ID,
+        env.GREEN_TOKEN,
+      );
+      if (sent) {
+        h2.push({ role: "assistant", text: result.text, ts: Date.now() });
+        await env.CHAT_RECORDS.put("chat:" + chatId, JSON.stringify(h2.slice(-MAX_HISTORY)));
+      }
+      await env.CHAT_RECORDS.put("d:" + chatId, missed.m.idMessage || "", {
+        expirationTtl: DEDUPE_TTL_SEC,
+      });
+      console.log("SWEEP_REPLY", chatId, result.brain, "sent", sent);
+    }
+  }
+  console.log("RECOVERY done checked", checked, "replied", replies);
 }
 
 // ---------- main handler ----------
@@ -570,7 +658,7 @@ export default {
     let history = loadHistory(await env.CHAT_RECORDS.get(key));
 
     // Owner commands (no AI, cheap)
-    const rawText = (messageData.textMessageData || {}).textMessage || "";
+    const rawText = extractText(messageData);
     const cmd = rawText.trim();
     if (isOwner && /^[!/]/.test(cmd)) {
       const command = cmd.slice(1).trim().toLowerCase();
@@ -591,20 +679,18 @@ export default {
     }
 
     // Non-text messages → polite ack, keep context, never silent
-    if (messageData.typeMessage !== "textMessage") {
-      if (NON_TEXT_TYPES.has(messageData.typeMessage)) {
-        await humanize();
-        const ack =
-          messageData.typeMessage === "stickerMessage"
-            ? pick(STICKER_ACK)
-            : pick(MEDIA_ACK);
-        await sendGreenApi(chatId, ack, env.GREEN_ID, env.GREEN_TOKEN);
-        history.push(
-          { role: "user", text: `(sent a ${messageData.typeMessage})`, ts: Date.now() },
-          { role: "assistant", text: ack, ts: Date.now() },
-        );
-        await env.CHAT_RECORDS.put(key, JSON.stringify(history.slice(-MAX_HISTORY)));
-      }
+    if (messageData.typeMessage !== "textMessage" && NON_TEXT_TYPES.has(messageData.typeMessage)) {
+      await humanize();
+      const ack =
+        messageData.typeMessage === "stickerMessage"
+          ? pick(STICKER_ACK)
+          : pick(MEDIA_ACK);
+      await sendGreenApi(chatId, ack, env.GREEN_ID, env.GREEN_TOKEN);
+      history.push(
+        { role: "user", text: `(sent a ${messageData.typeMessage})`, ts: Date.now() },
+        { role: "assistant", text: ack, ts: Date.now() },
+      );
+      await env.CHAT_RECORDS.put(key, JSON.stringify(history.slice(-MAX_HISTORY)));
       return new Response("ok");
     }
 
@@ -617,9 +703,13 @@ export default {
     await fetchContactIfNew(env, chatId, history.length);
     const lang = detectLang(text);
 
-    // Trivial / emoji-only → micro reply, zero AI
-    const micro = microReply(text, lang);
+    // Trivial / emoji-only → micro reply, zero AI (only as back-chat after we spoke)
+    const micro =
+      (history.length === 0 || history[history.length - 1].role === "assistant")
+        ? microReply(text, lang)
+        : null;
     if (micro) {
+      await humanize();
       await sendGreenApi(chatId, micro, env.GREEN_ID, env.GREEN_TOKEN);
       history.push(
         { role: "user", text, ts: Date.now() },
@@ -629,10 +719,12 @@ export default {
       return new Response("ok");
     }
 
-    // Instant multilingual greeting cache, zero AI
-    const cachedReply = cachedGreeting(text);
+    // Instant multilingual greeting cache, zero AI (first message only)
+    const cachedReply =
+      history.length === 0 ? cachedGreeting(text, lastAssistantText(history)) : null;
     if (cachedReply) {
       console.log("CACHED_REPLY", cachedReply);
+      await humanize();
       await sendGreenApi(chatId, cachedReply, env.GREEN_ID, env.GREEN_TOKEN);
       history.push(
         { role: "user", text, ts: Date.now() },
@@ -648,23 +740,22 @@ export default {
     if (!allowed) {
       const bm = burstMessage(lang);
       console.log("RATE_BOUNCED", chatId);
+      await humanize();
       await sendGreenApi(chatId, bm, env.GREEN_ID, env.GREEN_TOKEN);
       history.push(
         { role: "user", text, ts: Date.now() },
         { role: "assistant", text: bm, ts: Date.now() },
       );
       await env.CHAT_RECORDS.put(key, JSON.stringify(history.slice(-MAX_HISTORY)));
-      try {
-        await sweepUnreplied(env, persona);
-      } catch (err) {
-        console.log("SWEEP_ERR", String(err));
-      }
       return new Response("ok");
     }
 
     await humanize();
     history.push({ role: "user", text, ts: Date.now() });
-    const result = await replyChain(buildPrompt(persona, history, lang, who), env, lang);
+    const result = await replyChain(
+      buildPrompt(persona, history, lang, who),
+      env,
+    );
     if (result) {
       console.log("REPLY", result.brain, lang || "en");
       const sent = await sendGreenApi(chatId, result.text, env.GREEN_ID, env.GREEN_TOKEN);
@@ -673,17 +764,20 @@ export default {
       }
     } else {
       console.log("FULL_CHAIN_FAIL");
-      await sendGreenApi(chatId, holdMessage(lang), env.GREEN_ID, env.GREEN_TOKEN);
+      await humanize();
+      await sendGreenApi(chatId, holdMessage(), env.GREEN_ID, env.GREEN_TOKEN);
     }
     await env.CHAT_RECORDS.put(key, JSON.stringify(history.slice(-MAX_HISTORY)));
 
-    try {
-      await sweepUnreplied(env, persona);
-    } catch (err) {
-      console.log("SWEEP_ERR", String(err));
-    }
-
     return new Response("ok");
+  },
+
+  async scheduled(event, env, ctx) {
+    try {
+      await recoverMissed(env, env.PERSONA || PERSONA_DEFAULT);
+    } catch (err) {
+      console.log("SCHED_ERR", String(err));
+    }
   },
 };
 
@@ -705,39 +799,72 @@ const GREETING_ST =
 const GREETING_SN =
   /^(mhoro|mhoroi|mhoro\s*we|mangwanani|masikati|manheru|uri\s*sei|urisei|muriko|zviri\s*sei|zvirisei|zvinjani|makadini|makadii|wakadii|wakadini|hevo|hovo|uri\s*pano|muri\s*pano|(?:mhoro|mhoroi|hevo|hovo)\s+(?:uri\s*sei|uri\s*pano|muriko|zviri\s*sei|zvinjani|wakadii|makadini))$/;
 
-function cachedGreeting(text) {
+function pickAvoid(list, avoid) {
+  if (avoid && list.length > 1) {
+    const others = list.filter((x) => x !== avoid);
+    if (others.length) return pick(others);
+  }
+  return pick(list);
+}
+
+function cachedGreeting(text, avoid) {
   const clean = cleanGreetText(text);
   if (GREETING_EN.test(clean)) {
-    return [
-      "hey! what's up",
-      "yo how's it going",
-      "hi there",
-      "hey, all good here",
-      "sup! what's good",
-      "heya, how you doing",
-      "yo what's happening",
-      "howzit, what you up to",
-    ][Math.floor(Math.random() * 8)];
+    return pickAvoid(
+      [
+        "hey! what's up",
+        "yo how's it going",
+        "hi there",
+        "hey, all good here",
+        "sup! what's good",
+        "heya, how you doing",
+        "yo what's happening",
+        "howzit, what you up to",
+        "yo what's new with you",
+        "hey! all good, you?",
+        "heya! how are you doing",
+        "hi! how's everything",
+      ],
+      avoid,
+    );
   }
   if (GREETING_ST.test(clean)) {
-    return [
-      "dumelang! heita, u ntse joang?",
-      "heita shap! ke teng, wena u phela joang?",
-      "khotso! ho etsahalang le hona joale?",
-      "dumela, ke phela hantle. wena u ntse joang?",
-      "ho fetseng? ke teng, u tsoile joang?",
-      "shap! ke lokile, wena u phela joang?",
-    ][Math.floor(Math.random() * 6)];
+    return pickAvoid(
+      [
+        "dumelang! heita, u ntse joang?",
+        "heita shap! ke teng, wena u phela joang?",
+        "khotso! ho etsahalang le hona joale?",
+        "dumela, ke phela hantle. wena u ntse joang?",
+        "ho fetseng? ke teng, u tsoile joang?",
+        "shap! ke lokile, wena u phela joang?",
+        "dumela! ke thabile. wena u ntse joang?",
+        "heita! ke teng mona. u phela joang?",
+        "khotso! le hantle. u tsoile joang?",
+        "dumelang banna! ke teng, u phela joang?",
+        "shap! ke siboloha. wena?",
+        "ho lokile, kea leboha. u ntse joang?",
+      ],
+      avoid,
+    );
   }
   if (GREETING_SN.test(clean)) {
-    return [
-      "mhoro we! wakadii?",
-      "hevo! uri sei?",
-      "muriko? ndiri po",
-      "ndiri zvakanaka, iwe uri sei?",
-      "zvinjani? pane chii?",
-      "mhoro! ndiri pano, wena uri sei?",
-    ][Math.floor(Math.random() * 6)];
+    return pickAvoid(
+      [
+        "mhoro we! wakadii?",
+        "hevo! uri sei?",
+        "muriko? ndiri po",
+        "ndiri zvakanaka, iwe uri sei?",
+        "zvinjani? pane chii?",
+        "mhoro! ndiri pano, wena uri sei?",
+        "wakadii? ndiripo zvakanaka",
+        "hegu! uri sei zvino?",
+        "mhoro! ndiripo, pane chii?",
+        "makadii shamwari? ndiripo",
+        "ndiripo, wakadini iwe?",
+        "mangwanani! uri sei? (or masikati/manheru depending on time)",
+      ],
+      avoid,
+    );
   }
   return null;
 }
