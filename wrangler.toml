@@ -3,6 +3,9 @@ main = "worker.js"
 compatibility_date = "2024-12-01"
 workers_dev = true
 
+[vars]
+OWNER_CHATS = "26662172809@c.us"
+
 [[kv_namespaces]]
 binding = "CHAT_RECORDS"
 id = "a4644b1a887b4663805c51cd5efbd0ff"
