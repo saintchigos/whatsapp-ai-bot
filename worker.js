@@ -17,8 +17,38 @@
  * KV binding: CHAT_RECORDS
  */
 
-const PERSONA_DEFAULT =
+const GREETINGS_EN =
+  /^(hello|hi|hey|sup|yo|hola|good\s*(morning|afternoon|evening|day)|how\s*are\s*you|how\s*r\s*u|hru|nm\s*u|whats\s*up|wassup|waddup|dreetings|greetings|howdy|heya|wha\s*up)$/i;
+const GREETINGS_ST =
+  /^(dumela|dumelang|salibonani|ua\s*phela|le\s*kae|utimeile|kha\s*tsebe|hae\s*bele|njani|njani\s*na|kunjani|sawubona|unjani|ukhona\s*na|molo|ehleng|ehleng)$/i;
+const GREETINGS_SH =
+  /^(mhoroi|mangwanani|masikati|makorokoto|moro|mhoro|uri\s*zvipi|zvinjani|sezvo|makadii|mhoro\s*we|hey\s*we|mhlosho|siripo|siripho|uri\s*po|wauya|wakadii|yako)$/i;
+
+const GREETING_REPLIES_EN = [
+  "hey! what's up", "yo how's it going", "hi there", "hey, all good here",
+  "sup! what's good", "heya, how you doing", "yo what's happening",
+];
+const GREETING_REPLIES_ST = [
+  "eh, ke teng, u phela jwang?", "dumela! u kae?", "njani na, ke teng",
+  "le kae? ke thabile", "hae bele! u pileng", "tjena, ke peng hantle",
+];
+const GREETING_REPLIES_SH = [
+  "mhoro! uri zvipi?", "makadii, ndiri po", "mhoro we, zvinjani",
+  "mhoro, ndini", "uri po? ndiri zvakanaka", "hey we, zvinjani",
+];
+
+function pickGreeting(text) {
+  const clean = text.replace(/[!?.…,]+$/g, "").trim();
+  if (GREETINGS_EN.test(clean)) return GREETING_REPLIES_EN[Math.floor(Math.random() * GREETING_REPLIES_EN.length)];
+  if (GREETINGS_ST.test(clean)) return GREETING_REPLIES_ST[Math.floor(Math.random() * GREETING_REPLIES_ST.length)];
+  if (GREETINGS_SH.test(clean)) return GREETING_REPLIES_SH[Math.floor(Math.random() * GREETING_REPLIES_SH.length)];
+  return null;
+}
   "Reply like a normal friend texting back — short, casual, no robot talk. " +
+  "You speak three languages fluently: English, Sesotho and Shona. " +
+  "Reply in the SAME language the person writes to you: " +
+  "if they write in Sesotho, reply in Sesotho; if Shona, reply in Shona; " +
+  "if English, reply in English. " +
   "Use normal human language (lol, sure, nah, ok etc). Don't be formal or " +
   "overly helpful. Keep most replies to 1-2 sentences. If someone asks " +
   "something you don't know, just say you're not sure. Never say you're " +
@@ -42,7 +72,7 @@ function buildPrompt(persona, history) {
 async function askGemini(prompt, key, model) {
   const mdl = model || "gemini-flash-latest";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${mdl}:generateContent`;
-  const resp = await fetch(url, {
+  const options = {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -52,15 +82,36 @@ async function askGemini(prompt, key, model) {
       contents: [{ parts: [{ text: prompt }] }],
       generationConfig: { temperature: 0.7, maxOutputTokens: 400 },
     }),
-  });
-  if (!resp.ok) return null;
-  const data = await resp.json();
-  try {
-    const text = data.candidates[0].content.parts[0].text.trim();
-    return text || null;
-  } catch {
+  };
+
+  let lastStatus = 0;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 500 * attempt));
+    const resp = await fetch(url, options);
+    lastStatus = resp.status;
+
+    if (resp.ok) {
+      const data = await resp.json().catch(() => null);
+      try {
+        const text = data.candidates[0].content.parts[0].text.trim();
+        return text || null;
+      } catch {
+        return null;
+      }
+    }
+
+    if (resp.status === 429 || resp.status === 503) {
+      if (attempt < 3) {
+        console.log("GEMINI_RETRY", resp.status, "attempt", attempt + 1);
+        continue;
+      }
+    }
+    const errText = await resp.text().catch(() => "");
+    console.log("GEMINI_FAIL", resp.status, errText.slice(0, 200));
     return null;
   }
+  console.log("GEMINI_FAIL", lastStatus, "after retries");
+  return null;
 }
 
 async function sendGreenApi(chatId, message, id, token) {
@@ -70,6 +121,10 @@ async function sendGreenApi(chatId, message, id, token) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ chatId, message }),
   });
+  if (resp.status !== 200) {
+    const errText = await resp.text().catch(() => "");
+    console.log("SEND_FAIL", resp.status, errText.slice(0, 200));
+  }
   return resp.status === 200;
 }
 
@@ -113,28 +168,54 @@ export default {
     if (!text) {
       return new Response("ok");
     }
+    console.log("INCOMING", chatId, "-", text);
 
-    const key = "chat:" + chatId;
-    let history = [];
+    const cachedReply = pickGreeting(text);
+    if (cachedReply) {
+      console.log("CACHED_REPLY", cachedReply);
+      await sendGreenApi(chatId, cachedReply, env.GREEN_ID, env.GREEN_TOKEN);
+      const key = "chat:" + chatId;
+      let history = [];
+      try { history = JSON.parse((await env.CHAT_RECORDS.get(key)) || "[]"); } catch { history = []; }
+      if (!Array.isArray(history)) history = [];
+      history.push({ role: "user", text }, { role: "assistant", text: cachedReply });
+      await env.CHAT_RECORDS.put(key, JSON.stringify(history.slice(-MAX_HISTORY)));
+      return new Response("ok");
+    }
+
     try {
-      history = JSON.parse((await env.CHAT_RECORDS.get(key)) || "[]");
-    } catch {
-      history = [];
-    }
-    if (!Array.isArray(history)) history = [];
+      const key = "chat:" + chatId;
+      let history = [];
+      try {
+        history = JSON.parse((await env.CHAT_RECORDS.get(key)) || "[]");
+      } catch {
+        history = [];
+      }
+      if (!Array.isArray(history)) history = [];
 
-    history.push({ role: "user", text });
-    history = history.slice(-MAX_HISTORY);
-
-    const persona = env.PERSONA || PERSONA_DEFAULT;
-    const reply = await askGemini(buildPrompt(persona, history), env.GEMINI_KEY, env.GEMINI_MODEL);
-    if (reply) {
-      await sendGreenApi(chatId, reply, env.GREEN_ID, env.GREEN_TOKEN);
-      history.push({ role: "assistant", text: reply });
+      history.push({ role: "user", text });
       history = history.slice(-MAX_HISTORY);
-    }
 
-    await env.CHAT_RECORDS.put(key, JSON.stringify(history));
+      const persona = env.PERSONA || PERSONA_DEFAULT;
+      const reply = await askGemini(
+        buildPrompt(persona, history),
+        env.GEMINI_KEY,
+        env.GEMINI_MODEL,
+      );
+      console.log("GEMINI_REPLY", reply ? "yes" : "no");
+      if (reply) {
+        const sent = await sendGreenApi(chatId, reply, env.GREEN_ID, env.GREEN_TOKEN);
+        console.log("SEND_OK", sent);
+        if (sent) {
+          history.push({ role: "assistant", text: reply });
+          history = history.slice(-MAX_HISTORY);
+        }
+      }
+
+      await env.CHAT_RECORDS.put(key, JSON.stringify(history));
+    } catch (err) {
+      console.log("WORKER_ERR", String(err));
+    }
     return new Response("ok");
   },
 };
