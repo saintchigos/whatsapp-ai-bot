@@ -94,7 +94,8 @@ export default {
       return new Response("bad request", { status: 400 });
     }
 
-    const body = payload.body || {};
+    const body =
+      payload.body && typeof payload.body === "object" ? payload.body : payload;
     if (body.typeWebhook !== "incomingMessageReceived") {
       return new Response("ok");
     }
