@@ -25,7 +25,32 @@ messages for you. Completely independent of the car trimmers website.
    python bot.py
    ```
 
-## Always-on in the cloud (Docker)
+## Always-on in the cloud, FREE (recommended) — Cloudflare Workers
+
+No credit card, no sleeping server, never expires (free tier = 100k
+requests/day). The bot runs as a serverless webhook: it only wakes up when a
+WhatsApp message arrives, asks Gemini, replies, and remembers the conversation
+in Workers KV. Everything lives in `worker.js`.
+
+1. Create a free Cloudflare account at https://dash.cloudflare.com (no card).
+2. **Workers & Pages → Create → Worker** → delete the starter code and paste
+   the contents of `worker.js` → **Save and Deploy**.
+3. **Settings → Variables**:
+   - Add `GREEN_ID` and `GREEN_TOKEN` (from GreenAPI) — mark as secrets.
+   - Add `GEMINI_KEY` (your AQ./AIza key) as a secret.
+   - (Optional) `GEMINI_MODEL` = `gemini-flash-latest`, `PERSONA` = your prompt.
+   - (Optional) `WEBHOOK_SECRET` = a password you invent.
+4. **Settings → KV bindings → Create namespace** named `CHAT_RECORDS`; bind it
+   to variable `CHAT_RECORDS`. This stores conversation history.
+5. Copy your Worker URL, e.g. `https://whatsapp-bot.you.workers.dev`.
+6. On GreenAPI → your instance → **Webhook URL**, set it to
+   `https://whatsapp-bot.you.workers.dev/?secret=YOUR_SECRET` (omit `?secret=`
+   if you didn't add `WEBHOOK_SECRET`).
+7. Message your WhatsApp number from another phone — the AI should reply.
+
+Your free quota handles roughly 100k messages/day, far beyond personal use.
+
+## Alt: run it yourself as a container (Docker)
 
 A `Dockerfile` is included. Build and run, setting `DATA_DIR` to a persistent
 volume so conversation history survives restarts. Example:
@@ -34,6 +59,8 @@ volume so conversation history survives restarts. Example:
 docker build -t whatsapp-ai-bot .
 docker run -d --env-file .env -v whatsbot_data:/data whatsapp-ai-bot
 ```
+
+Or locally without Docker: `python bot.py` (see Setup above).
 
 Keep `data/conversations.json` in git out (it contains chat history) — add a
 `.gitignore` with `.env` and `data/` if you commit this to GitHub.
