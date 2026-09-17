@@ -5,6 +5,7 @@ workers_dev = true
 
 [vars]
 OWNER_CHATS = "26662172809@c.us"
+META_VERIFY_TOKEN = "bot62848760"
 
 [[kv_namespaces]]
 binding = "CHAT_RECORDS"

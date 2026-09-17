@@ -1,20 +1,23 @@
 /**
  * WhatsApp AI auto-replier (Cloudflare Worker — free, always-on).
  *
- * Receives webhooks from GreenAPI when a WhatsApp message arrives, asks
- * Gemini for a reply (with Cloudflare's free Workers AI as backup brain),
- * sends it back via GreenAPI, and remembers each conversation in Workers KV.
+ * Receives WhatsApp Cloud API webhooks (Meta) when a WhatsApp message arrives,
+ * asks Gemini for a reply (with Cloudflare's free Workers AI as backup brain),
+ * sends it back via the Meta Graph API, and remembers each conversation in
+ * Workers KV. Free: customer-service replies inside the 24h window cost 0.
  *
  * Environment variables (set in the Workers dashboard / wrangler.toml):
- *   GREEN_ID        - GreenAPI idInstance
- *   GREEN_TOKEN     - GreenAPI apiTokenInstance
- *   GEMINI_KEY      - Gemini API key (AQ... or AIza... format)
- *   GEMINI_MODEL    - optional, default "gemini-flash-latest"
- *   PERSONA         - optional system prompt for the AI
- *   WEBHOOK_SECRET  - optional shared secret; if set, the webhook must include
- *                     it as ?secret=... in the URL configured on GreenAPI.
- *   OWNER_CHATS     - comma-separated chatIds that get owner commands and are
- *                     never rate-limited (e.g. "26662172809@c.us")
+ *   META_TOKEN         - Meta Graph API access token (with whatsapp_business_messaging)
+ *   META_PHONE_ID      - numeric WhatsApp phone-number ID (from Meta dashboard)
+ *   META_VERIFY_TOKEN  - string you choose; must match the one in the Meta
+ *                        webhook config (hub.verify_token)
+ *   META_APP_SECRET    - optional; if set, webhook payloads are validated with
+ *                        X-Hub-Signature-256 (HMAC-SHA256 of the raw body)
+ *   GEMINI_KEY         - Gemini API key (AQ... or AIza... format)
+ *   GEMINI_MODEL       - optional, default "gemini-flash-latest"
+ *   PERSONA            - optional system prompt for the AI
+ *   OWNER_CHATS        - comma-separated chatIds that get owner commands and are
+ *                        never rate-limited (e.g. "26662172809@c.us")
  *
  * Bindings:
  *   CHAT_RECORDS  - KV namespace (conversation history + caches + dedupe)
@@ -62,10 +65,10 @@ const AI_BURST_MAX = 14;           // AI replies per minute, global cap
 const CONTACT_TTL_MS = 86400000;   // 24h contact cache
 const DEDUPE_TTL_SEC = 604800;     // 7 days
 const BOT_WID = "26662848760@c.us";
-const SWEEP_LOOKBACK_MS = 14 * 3600 * 1000; // only catch messages this old
-const SWEEP_MAX_CONTACTS = 40;     // contacts probed per recovery run
-const SWEEP_MAX_REPLIES = 3;       // replies sent per recovery run
+const SWEEP_LOOKBACK_MS = 7 * 24 * 3600 * 1000; // backfill "left on read" up to 7 days
+const SWEEP_MAX_REPLIES = 5;       // replies sent per recovery run
 const SWEEP_COOLDOWN_SEC = 600;    // min gap between recovery runs (cron 10min)
+const GRAPH_VERSION = "v21.0";
 
 const SHONA_MARKERS = [
   "mhoro", "mhoroi", "wakadii", "makadini", "zviri", "zvipi", "zvakanaka",
@@ -119,6 +122,8 @@ const MICRO_SN = ["hevo!", "ndatenda!", "ok"];
 const STICKER_ACK = [
   "lol nice sticker",
   "haha that one's a vibe",
+  "accepted 😂",
+  "😂",
   "fire one 😂",
   "aight this sticker tho 😂",
 ];
@@ -181,6 +186,8 @@ function extractText(messageData) {
   const raw = messageData || {};
   const td = raw.textMessageData || {};
   if (td.textMessage) return String(td.textMessage).trim();
+  const imd = raw.interactiveMessageData || {};
+  if (imd.title) return String(imd.title).trim();
   const ext = raw.extendedTextMessage || td.extendedTextMessage || {};
   if (ext.text) return String(ext.text).trim();
   const q = raw.quotedMessage || {};
@@ -189,6 +196,104 @@ function extractText(messageData) {
     return String(q.extendedTextMessage.text).trim();
   }
   return "";
+}
+
+// ---------- Meta Cloud API (webhook + sending) ----------
+
+function waId(chatId) {
+  return (chatId || "").replace(/@c\.us$/, "");
+}
+
+async function sendMeta(chatId, message, env) {
+  const url = `https://graph.facebook.com/${GRAPH_VERSION}/${env.META_PHONE_ID}/messages`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${env.META_TOKEN}`,
+    },
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      to: waId(chatId),
+      type: "text",
+      text: { body: message },
+    }),
+  });
+  if (!resp.ok) {
+    const errText = await resp.text().catch(() => "");
+    console.log("SEND_FAIL", resp.status, errText.slice(0, 200));
+  }
+  return resp.ok;
+}
+
+// Turn a Meta Cloud API message object into the internal messageData shape.
+function metaMessageData(msg) {
+  const type = msg.type || "text";
+  if (type === "reaction") return null; // emoji react to our own message: ignore
+  const txt =
+    (type === "text" && msg.text && msg.text.body) ||
+    (type === "button" && msg.button && msg.button.text) ||
+    (type === "interactive" &&
+      msg.interactive &&
+      ((msg.interactive.button_reply && msg.interactive.button_reply.title) ||
+        (msg.interactive.list_reply && msg.interactive.list_reply.title))) ||
+    (type === "image" && msg.image && msg.image.caption) ||
+    (type === "video" && msg.video && msg.video.caption) ||
+    (type === "document" && msg.document && msg.document.caption) ||
+    "";
+  return {
+    typeMessage:
+      type === "text" || type === "button" || type === "interactive"
+        ? "textMessage"
+        : type + "Message",
+    textMessageData: { textMessage: txt },
+    interactiveMessageData:
+      type === "interactive" ? { title: txt } : undefined,
+  };
+}
+
+async function validSignature(secret, raw, sig) {
+  if (!secret || !sig || !sig.startsWith("sha256=")) return false;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, raw));
+  const hex = [...mac].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return hex === sig.slice(7);
+}
+
+async function cacheProfile(env, chatId, profileName) {
+  if (!profileName) return null;
+  try {
+    const ck = "cnt:" + chatId;
+    const raw = await env.CHAT_RECORDS.get(ck);
+    let cached = null;
+    try {
+      cached = raw ? JSON.parse(raw) : null;
+    } catch {}
+    if (
+      cached &&
+      cached.profileName === profileName &&
+      Date.now() - (cached.ts || 0) < CONTACT_TTL_MS
+    ) {
+      return { contactName: cached.contactName || "", profileName };
+    }
+    const entry = {
+      contactName: (cached && cached.contactName) || "",
+      profileName,
+      ts: Date.now(),
+    };
+    await env.CHAT_RECORDS.put(ck, JSON.stringify(entry), { expirationTtl: 172800 });
+    console.log("CONTACT fetch", chatId, profileName);
+    return entry;
+  } catch (err) {
+    console.log("CONTACT_ERR", String(err));
+    return null;
+  }
 }
 
 // ---------- AI ----------
@@ -346,7 +451,7 @@ async function dedupeCheck(env, chatId, idMessage) {
   return false;
 }
 
-// ---------- contacts (how the owner saved the person) ----------
+// ---------- contacts (what the AI knows about who it's texting) ----------
 
 async function whoContext(env, chatId, senderData) {
   let saved = (senderData && senderData.senderContactName || "").trim();
@@ -392,42 +497,6 @@ async function whoContext(env, chatId, senderData) {
   return null;
 }
 
-async function fetchContactIfNew(env, chatId, historyLen) {
-  if (historyLen > 0) return null;
-  try {
-    const ck = "cnt:" + chatId;
-    const raw = await env.CHAT_RECORDS.get(ck);
-    if (raw) return null;
-    const url = `https://api.green-api.com/waInstance${env.GREEN_ID}/getContactInfo/${env.GREEN_TOKEN}`;
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chatId }),
-    });
-    if (resp.status === 200) {
-      const data = await resp.json().catch(() => null);
-      if (data && (data.contactName || data.name)) {
-        await env.CHAT_RECORDS.put(
-          ck,
-          JSON.stringify({
-            contactName: data.contactName || "",
-            profileName: data.name || "",
-            ts: Date.now(),
-          }),
-          { expirationTtl: 172800 },
-        );
-        console.log("CONTACT fetch", chatId, data.contactName || data.name);
-      } else {
-        await env.CHAT_RECORDS.put(ck, JSON.stringify({ empty: 1, ts: Date.now() }), {
-          expirationTtl: 172800,
-        });
-      }
-    }
-  } catch (err) {
-    console.log("CONTACT_ERR", String(err));
-  }
-}
-
 // ---------- media / micro handling ----------
 
 const MICRO_PATTERN = [
@@ -456,63 +525,26 @@ const NON_TEXT_TYPES = new Set([
   "groupInviteMessage",
 ]);
 
-// ---------- send ----------
+// ---------- inbox ledger (replaces the GreenAPI journal for recovery) ----------
 
-async function sendGreenApi(chatId, message, id, token) {
-  const url = `https://api.green-api.com/waInstance${id}/SendMessage/${token}`;
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chatId, message }),
-  });
-  if (resp.status !== 200) {
-    const errText = await resp.text().catch(() => "");
-    console.log("SEND_FAIL", resp.status, errText.slice(0, 200));
-  }
-  return resp.status === 200;
-}
+const INBOX_MAX = 300;
 
-// ---------- contact-based recovery (catches missed webhooks) ----------
-
-async function getGreenContacts(id, token) {
+async function pushInbox(env, rec) {
   try {
-    const resp = await fetch(
-      `https://api.green-api.com/waInstance${id}/getContacts/${token}`,
-      { method: "GET" },
-    );
-    if (!resp.ok) {
-      console.log("CONTACTS_FAIL", resp.status);
-      return [];
-    }
-    const arr = await resp.json().catch(() => []);
-    return Array.isArray(arr) ? arr : [];
+    let list = [];
+    try {
+      list = JSON.parse((await env.CHAT_RECORDS.get("inbox")) || "[]");
+    } catch {}
+    if (!Array.isArray(list)) list = [];
+    list.unshift(rec);
+    if (list.length > INBOX_MAX) list.length = INBOX_MAX;
+    await env.CHAT_RECORDS.put("inbox", JSON.stringify(list));
   } catch (err) {
-    console.log("CONTACTS_ERR", String(err));
-    return [];
+    console.log("INBOX_ERR", String(err));
   }
 }
 
-async function pullChatHistory(chatId, count, id, token) {
-  try {
-    const resp = await fetch(
-      `https://api.green-api.com/waInstance${id}/getChatHistory/${token}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chatId, count }),
-      },
-    );
-    if (!resp.ok) {
-      console.log("HISTORY_FAIL", chatId, resp.status);
-      return [];
-    }
-    const arr = await resp.json().catch(() => []);
-    return Array.isArray(arr) ? arr : [];
-  } catch (err) {
-    console.log("HISTORY_ERR", String(err));
-    return [];
-  }
-}
+// ---------- contact-based recovery (catches missed webhooks / left-on-read) ----------
 
 async function recoverMissed(env, persona) {
   const now = Date.now();
@@ -529,102 +561,256 @@ async function recoverMissed(env, persona) {
     return;
   }
 
-  const contacts = await getGreenContacts(env.GREEN_ID, env.GREEN_TOKEN);
-  const targets = (contacts || [])
-    .map((c) => c && c.id)
-    .filter(
-      (id) =>
-        id &&
-        id.endsWith("@c.us") &&
-        id !== BOT_WID &&
-        id !== "0@c.us" &&
-        !id.startsWith("0@"),
-    );
-  if (!targets.length) {
+  let list = [];
+  try {
+    list = JSON.parse((await env.CHAT_RECORDS.get("inbox")) || "[]");
+  } catch {}
+  if (!Array.isArray(list) || list.length === 0) {
     console.log("SWEEP_NONE");
     return;
   }
 
-  let checked = 0;
   let replies = 0;
-  for (const chatId of targets) {
-    if (checked >= SWEEP_MAX_CONTACTS || replies >= SWEEP_MAX_REPLIES) break;
-    checked++;
-
-    const hist = loadHistory(await env.CHAT_RECORDS.get("chat:" + chatId));
-    const last = hist[hist.length - 1];
-    if (last && last.role === "assistant" && now - (last.ts || 0) < 12 * 3600 * 1000) {
+  for (const m of list) {
+    if (replies >= SWEEP_MAX_REPLIES) break;
+    const chatId = m.chatId;
+    if (!chatId || !chatId.endsWith("@c.us") || chatId === BOT_WID || chatId === "0@c.us") {
       continue;
     }
+    const ts = m.ts || 0;
+    if (now - ts > SWEEP_LOOKBACK_MS) continue;
 
-    const msgs = await pullChatHistory(chatId, 3, env.GREEN_ID, env.GREEN_TOKEN);
-    let missed = null;
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const m = msgs[i];
-      if (!m || m.type !== "incoming" || m.senderId !== chatId) continue;
-      const ts = (m.timestamp || 0) * 1000;
-      if (now - ts > SWEEP_LOOKBACK_MS) continue;
-      const dup = await env.CHAT_RECORDS.get("d:" + chatId).catch(() => null);
-      if (dup === (m.idMessage || "")) continue;
-      const text = extractText(m);
-      if (!text) continue;
-      missed = { m, text, ts };
+    const text = (m.text || "").trim();
+    if (!text || text.startsWith("{{")) continue;
+
+    const dup = await env.CHAT_RECORDS.get("d:" + chatId).catch(() => null);
+    if (dup === (m.idMessage || "")) continue;
+
+    const h2 = loadHistory(await env.CHAT_RECORDS.get("chat:" + chatId));
+    const last = h2[h2.length - 1];
+    if (
+      last &&
+      last.role === "assistant" &&
+      (last.ts || 0) >= ts
+    ) {
+      continue; // already replied to this exchange
     }
-    if (!missed) continue;
-    if (replies >= SWEEP_MAX_REPLIES) break;
-    replies++;
 
-    console.log("SWEEP_FOUND", chatId, "-", missed.text.slice(0, 60));
-    const lang = detectLang(missed.text);
+    console.log("SWEEP_FOUND", chatId, "-", text.slice(0, 60));
+    const lang = detectLang(text);
     let who = null;
     try {
       const rc = JSON.parse((await env.CHAT_RECORDS.get("cnt:" + chatId)) || "null");
       who = (rc && (rc.contactName || rc.profileName)) || null;
     } catch {}
 
-    const h2 = loadHistory(await env.CHAT_RECORDS.get("chat:" + chatId));
-    if (!h2.length) {
-      await fetchContactIfNew(env, chatId, 0);
-    }
-    h2.push({ role: "user", text: missed.text, ts: missed.ts });
-    const result = await replyChain(
-      buildPrompt(persona, h2, lang, who),
-      env,
-    );
+    h2.push({ role: "user", text, ts });
+    const result = await replyChain(buildPrompt(persona, h2, lang, who), env);
     if (result) {
-      const sent = await sendGreenApi(
-        chatId,
-        result.text,
-        env.GREEN_ID,
-        env.GREEN_TOKEN,
-      );
+      const sent = await sendMeta(chatId, result.text, env);
       if (sent) {
         h2.push({ role: "assistant", text: result.text, ts: Date.now() });
         await env.CHAT_RECORDS.put("chat:" + chatId, JSON.stringify(h2.slice(-MAX_HISTORY)));
+        await env.CHAT_RECORDS.put("d:" + chatId, m.idMessage || "", {
+          expirationTtl: DEDUPE_TTL_SEC,
+        });
       }
-      await env.CHAT_RECORDS.put("d:" + chatId, missed.m.idMessage || "", {
-        expirationTtl: DEDUPE_TTL_SEC,
-      });
       console.log("SWEEP_REPLY", chatId, result.brain, "sent", sent);
+      replies++;
     }
   }
-  console.log("RECOVERY done checked", checked, "replied", replies);
+  console.log("RECOVERY done replied", replies);
+}
+
+// ---------- main message pipeline (per incoming WhatsApp message) ----------
+
+async function processMessage(env, chatId, idMessage, senderData, messageData) {
+  const persona = env.PERSONA || PERSONA_DEFAULT;
+  const key = "chat:" + chatId;
+  const isOwner = isOwnerChat(env, chatId);
+  let history = loadHistory(await env.CHAT_RECORDS.get(key));
+
+  // Owner commands (no AI, cheap)
+  const rawText = extractText(messageData);
+  const cmd = rawText.trim();
+  if (isOwner && /^[!/]/.test(cmd)) {
+    const command = cmd.slice(1).trim().toLowerCase();
+    if (command === "help" || command === "help me") {
+      const help =
+        "*Tino's toolbox*\n" +
+        "• /reset — forget this chat's history\n" +
+        "• !help — this list\n" +
+        "• Talk normally for anything else :)";
+      await sendMeta(chatId, help, env);
+      return;
+    }
+    if (command === "reset") {
+      await env.CHAT_RECORDS.put(key, "[]");
+      await sendMeta(chatId, "aight, fresh start", env);
+      return;
+    }
+  }
+
+  // Non-text messages → polite ack, keep context, never silent
+  if (messageData.typeMessage !== "textMessage" && NON_TEXT_TYPES.has(messageData.typeMessage)) {
+    await humanize();
+    const ack =
+      messageData.typeMessage === "stickerMessage"
+        ? pick(STICKER_ACK)
+        : pick(MEDIA_ACK);
+    await sendMeta(chatId, ack, env);
+    history.push(
+      { role: "user", text: `(sent a ${messageData.typeMessage})`, ts: Date.now() },
+      { role: "assistant", text: ack, ts: Date.now() },
+    );
+    await env.CHAT_RECORDS.put(key, JSON.stringify(history.slice(-MAX_HISTORY)));
+    return;
+  }
+
+  const text = rawText.trim();
+  if (!text) {
+    return;
+  }
+  console.log("INCOMING", chatId, "-", text, isOwner ? "owner" : "guest");
+
+  const lang = detectLang(text);
+
+  // Trivial / emoji-only → micro reply, zero AI (only as back-chat after we spoke)
+  const micro =
+    (history.length === 0 || history[history.length - 1].role === "assistant")
+      ? microReply(text, lang)
+      : null;
+  if (micro) {
+    await humanize();
+    await sendMeta(chatId, micro, env);
+    history.push(
+      { role: "user", text, ts: Date.now() },
+      { role: "assistant", text: micro, ts: Date.now() },
+    );
+    await env.CHAT_RECORDS.put(key, JSON.stringify(history.slice(-MAX_HISTORY)));
+    return;
+  }
+
+  // Instant multilingual greeting cache, zero AI (first message only)
+  const cachedReply =
+    history.length === 0 ? cachedGreeting(text, lastAssistantText(history)) : null;
+  if (cachedReply) {
+    console.log("CACHED_REPLY", cachedReply);
+    await humanize();
+    await sendMeta(chatId, cachedReply, env);
+    history.push(
+      { role: "user", text, ts: Date.now() },
+      { role: "assistant", text: cachedReply, ts: Date.now() },
+    );
+    await env.CHAT_RECORDS.put(key, JSON.stringify(history.slice(-MAX_HISTORY)));
+    return;
+  }
+
+  // AI paths, gated by rate guards
+  const allowed = await rateAllowed(env, chatId, isOwner);
+  const who = await whoContext(env, chatId, senderData);
+  if (!allowed) {
+    const bm = burstMessage(lang);
+    console.log("RATE_BOUNCED", chatId);
+    await humanize();
+    await sendMeta(chatId, bm, env);
+    history.push(
+      { role: "user", text, ts: Date.now() },
+      { role: "assistant", text: bm, ts: Date.now() },
+    );
+    await env.CHAT_RECORDS.put(key, JSON.stringify(history.slice(-MAX_HISTORY)));
+    return;
+  }
+
+  await humanize();
+  history.push({ role: "user", text, ts: Date.now() });
+  const result = await replyChain(
+    buildPrompt(persona, history, lang, who),
+    env,
+  );
+  if (result) {
+    console.log("REPLY", result.brain, lang || "en");
+    const sent = await sendMeta(chatId, result.text, env);
+    if (sent) {
+      history.push({ role: "assistant", text: result.text, ts: Date.now() });
+    }
+  } else {
+    console.log("FULL_CHAIN_FAIL");
+    await humanize();
+    await sendMeta(chatId, holdMessage(), env);
+  }
+  await env.CHAT_RECORDS.put(key, JSON.stringify(history.slice(-MAX_HISTORY)));
+}
+
+async function handleIncoming(env, ctx, msg, profileName) {
+  const from = msg.from;
+  if (!from) return;
+  const chatId = (from + "@c.us").replace("@s.whatsapp.net@c.us", "@c.us");
+  if (chatId === BOT_WID || chatId === "0@c.us" || chatId.endsWith("@g.us")) {
+    return;
+  }
+  const idMessage = msg.id || "";
+  const ts = (parseInt(msg.timestamp || "0", 10) || 0) * 1000;
+  const messageData = metaMessageData(msg);
+  if (!messageData) return; // e.g. reaction
+
+  // Backstop recovery: every incoming webhook also runs an inbox sweep to
+  // catch stale / left-on-read messages (cooldown-gated, so it's cheap).
+  ctx.waitUntil(
+    recoverMissed(env, env.PERSONA || PERSONA_DEFAULT).catch((err) =>
+      console.log("SWEEP_WH_ERR", String(err)),
+    ),
+  );
+
+  if (profileName) {
+    await cacheProfile(env, chatId, profileName);
+  }
+
+  if (await dedupeCheck(env, chatId, idMessage)) {
+    return;
+  }
+
+  await pushInbox(env, {
+    chatId,
+    idMessage,
+    text: extractText(messageData),
+    ts,
+  });
+
+  const senderData = { chatId, senderName: profileName, senderContactName: profileName };
+  await processMessage(env, chatId, idMessage, senderData, messageData);
 }
 
 // ---------- main handler ----------
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const sp = url.searchParams;
+
+    // WhatsApp Cloud API webhook verification (Meta pings this GET once).
     if (request.method === "GET") {
+      if (sp.get("hub.mode") === "subscribe") {
+        if (sp.get("hub.verify_token") === env.META_VERIFY_TOKEN) {
+          return new Response(sp.get("hub.challenge") || "ok", { status: 200 });
+        }
+        return new Response("forbidden", { status: 403 });
+      }
       return new Response("whatsapp-ai-bot is alive", { status: 200 });
     }
+
     if (request.method !== "POST") {
       return new Response("method not allowed", { status: 405 });
     }
 
-    const url = new URL(request.url);
-    if (env.WEBHOOK_SECRET && url.searchParams.get("secret") !== env.WEBHOOK_SECRET) {
-      return new Response("unauthorized", { status: 401 });
+    // Optional payload authenticity check via X-Hub-Signature-256.
+    if (env.META_APP_SECRET) {
+      const raw = await request.clone().arrayBuffer();
+      const sig = request.headers.get("x-hub-signature-256") || "";
+      if (!(await validSignature(env.META_APP_SECRET, raw, sig))) {
+        console.log("SIGNATURE_BAD");
+        return new Response("unauthorized", { status: 401 });
+      }
     }
 
     let payload;
@@ -634,142 +820,27 @@ export default {
       return new Response("bad request", { status: 400 });
     }
 
-    const body = payload.body && typeof payload.body === "object" ? payload.body : payload;
-    if (body.typeWebhook !== "incomingMessageReceived") {
-      return new Response("ok");
-    }
-
-    const senderData = body.senderData || {};
-    const chatId = senderData.chatId;
-    const idMessage = body.idMessage || "";
-    const messageData = body.messageData || {};
-
-    if (!chatId || chatId.endsWith("@g.us")) {
-      return new Response("ok");
-    }
-
-    if (await dedupeCheck(env, chatId, idMessage)) {
-      return new Response("ok");
-    }
-
-    const persona = env.PERSONA || PERSONA_DEFAULT;
-    const key = "chat:" + chatId;
-    const isOwner = isOwnerChat(env, chatId);
-    let history = loadHistory(await env.CHAT_RECORDS.get(key));
-
-    // Owner commands (no AI, cheap)
-    const rawText = extractText(messageData);
-    const cmd = rawText.trim();
-    if (isOwner && /^[!/]/.test(cmd)) {
-      const command = cmd.slice(1).trim().toLowerCase();
-      if (command === "help" || command === "help me") {
-        const help =
-          "*Tino's toolbox*\n" +
-          "• /reset — forget this chat's history\n" +
-          "• !help — this list\n" +
-          "• Talk normally for anything else :)";
-        await sendGreenApi(chatId, help, env.GREEN_ID, env.GREEN_TOKEN);
-        return new Response("ok");
-      }
-      if (command === "reset") {
-        await env.CHAT_RECORDS.put(key, "[]");
-        await sendGreenApi(chatId, "aight, fresh start", env.GREEN_ID, env.GREEN_TOKEN);
-        return new Response("ok");
+    for (const entry of payload.entry || []) {
+      for (const change of entry.changes || []) {
+        const value = change.value || {};
+        if (!value.messages || !Array.isArray(value.messages)) continue;
+        const profileByName = {};
+        for (const c of value.contacts || []) {
+          if (c.wa_id && c.profile && c.profile.name) {
+            profileByName[c.wa_id] = String(c.profile.name).trim();
+          }
+        }
+        for (const msg of value.messages || []) {
+          ctx.waitUntil(
+            handleIncoming(env, ctx, msg, profileByName[msg.from] || "").catch((err) =>
+              console.log("HANDLE_ERR", String(err)),
+            ),
+          );
+        }
       }
     }
 
-    // Non-text messages → polite ack, keep context, never silent
-    if (messageData.typeMessage !== "textMessage" && NON_TEXT_TYPES.has(messageData.typeMessage)) {
-      await humanize();
-      const ack =
-        messageData.typeMessage === "stickerMessage"
-          ? pick(STICKER_ACK)
-          : pick(MEDIA_ACK);
-      await sendGreenApi(chatId, ack, env.GREEN_ID, env.GREEN_TOKEN);
-      history.push(
-        { role: "user", text: `(sent a ${messageData.typeMessage})`, ts: Date.now() },
-        { role: "assistant", text: ack, ts: Date.now() },
-      );
-      await env.CHAT_RECORDS.put(key, JSON.stringify(history.slice(-MAX_HISTORY)));
-      return new Response("ok");
-    }
-
-    const text = rawText.trim();
-    if (!text) {
-      return new Response("ok");
-    }
-    console.log("INCOMING", chatId, "-", text, isOwner ? "owner" : "guest");
-
-    await fetchContactIfNew(env, chatId, history.length);
-    const lang = detectLang(text);
-
-    // Trivial / emoji-only → micro reply, zero AI (only as back-chat after we spoke)
-    const micro =
-      (history.length === 0 || history[history.length - 1].role === "assistant")
-        ? microReply(text, lang)
-        : null;
-    if (micro) {
-      await humanize();
-      await sendGreenApi(chatId, micro, env.GREEN_ID, env.GREEN_TOKEN);
-      history.push(
-        { role: "user", text, ts: Date.now() },
-        { role: "assistant", text: micro, ts: Date.now() },
-      );
-      await env.CHAT_RECORDS.put(key, JSON.stringify(history.slice(-MAX_HISTORY)));
-      return new Response("ok");
-    }
-
-    // Instant multilingual greeting cache, zero AI (first message only)
-    const cachedReply =
-      history.length === 0 ? cachedGreeting(text, lastAssistantText(history)) : null;
-    if (cachedReply) {
-      console.log("CACHED_REPLY", cachedReply);
-      await humanize();
-      await sendGreenApi(chatId, cachedReply, env.GREEN_ID, env.GREEN_TOKEN);
-      history.push(
-        { role: "user", text, ts: Date.now() },
-        { role: "assistant", text: cachedReply, ts: Date.now() },
-      );
-      await env.CHAT_RECORDS.put(key, JSON.stringify(history.slice(-MAX_HISTORY)));
-      return new Response("ok");
-    }
-
-    // AI paths, gated by rate guards
-    const allowed = await rateAllowed(env, chatId, isOwner);
-    const who = await whoContext(env, chatId, senderData);
-    if (!allowed) {
-      const bm = burstMessage(lang);
-      console.log("RATE_BOUNCED", chatId);
-      await humanize();
-      await sendGreenApi(chatId, bm, env.GREEN_ID, env.GREEN_TOKEN);
-      history.push(
-        { role: "user", text, ts: Date.now() },
-        { role: "assistant", text: bm, ts: Date.now() },
-      );
-      await env.CHAT_RECORDS.put(key, JSON.stringify(history.slice(-MAX_HISTORY)));
-      return new Response("ok");
-    }
-
-    await humanize();
-    history.push({ role: "user", text, ts: Date.now() });
-    const result = await replyChain(
-      buildPrompt(persona, history, lang, who),
-      env,
-    );
-    if (result) {
-      console.log("REPLY", result.brain, lang || "en");
-      const sent = await sendGreenApi(chatId, result.text, env.GREEN_ID, env.GREEN_TOKEN);
-      if (sent) {
-        history.push({ role: "assistant", text: result.text, ts: Date.now() });
-      }
-    } else {
-      console.log("FULL_CHAIN_FAIL");
-      await humanize();
-      await sendGreenApi(chatId, holdMessage(), env.GREEN_ID, env.GREEN_TOKEN);
-    }
-    await env.CHAT_RECORDS.put(key, JSON.stringify(history.slice(-MAX_HISTORY)));
-
-    return new Response("ok");
+    return new Response("ok", { status: 200 });
   },
 
   async scheduled(event, env, ctx) {

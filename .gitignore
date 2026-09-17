@@ -6,3 +6,6 @@ __pycache__/
 *.pyc
 .wrangler/
 wrangler-account.json
+bridge/node_modules/
+bridge/session/
+bridge/*.log

@@ -1,72 +1,106 @@
-# WhatsApp AI bot (personal project — not part of the website)
+# WhatsApp AI bot — human-like auto-replies using YOUR own local AI
 
-A standalone, always-on WhatsApp auto-replier. Uses GreenAPI (your personal
-WhatsApp number stays on their cloud) and Google Gemini (free tier) to answer
-messages for you. Completely independent of the car trimmers website.
-
-## How it works
-
-1. Polls GreenAPI for new incoming messages.
-2. Sends the message (plus recent history for that contact) to Gemini.
-3. Sends Gemini's reply back to the contact on WhatsApp.
-4. Stores per-contact conversation history in `data/conversations.json`.
-
-## Setup
-
-1. **GreenAPI** — create an account at https://green-api.com, add your WhatsApp
-   number, and copy the `idInstance` and `apiTokenInstance` from your cabinet.
-2. **Gemini key** — get a free API key at https://aistudio.google.com/app/apikey.
-3. Create `.env` from `.env.example` and fill in the values.
-4. Run locally:
-   ```
-   python -m venv venv
-   venv\Scripts\activate        # Windows
-   pip install -r requirements.txt
-   python bot.py
-   ```
-
-## Always-on in the cloud, FREE (recommended) — Cloudflare Workers
-
-No credit card, no sleeping server, never expires (free tier = 100k
-requests/day). The bot runs as a serverless webhook: it only wakes up when a
-WhatsApp message arrives, asks Gemini, replies, and remembers the conversation
-in Workers KV. Everything lives in `worker.js`.
-
-1. Create a free Cloudflare account at https://dash.cloudflare.com (no card).
-2. **Workers & Pages → Create → Worker** → delete the starter code and paste
-   the contents of `worker.js` → **Save and Deploy**.
-3. **Settings → Variables**:
-   - Add `GREEN_ID` and `GREEN_TOKEN` (from GreenAPI) — mark as secrets.
-   - Add `GEMINI_KEY` (your AQ./AIza key) as a secret.
-   - (Optional) `GEMINI_MODEL` = `gemini-flash-latest`, `PERSONA` = your prompt.
-   - (Optional) `WEBHOOK_SECRET` = a password you invent.
-4. **Settings → KV bindings → Create namespace** named `CHAT_RECORDS`; bind it
-   to variable `CHAT_RECORDS`. This stores conversation history.
-5. Copy your Worker URL, e.g. `https://whatsapp-bot.you.workers.dev`.
-6. On GreenAPI → your instance → **Webhook URL**, set it to
-   `https://whatsapp-bot.you.workers.dev/?secret=YOUR_SECRET` (omit `?secret=`
-   if you didn't add `WEBHOOK_SECRET`).
-7. Message your WhatsApp number from another phone — the AI should reply.
-
-Your free quota handles roughly 100k messages/day, far beyond personal use.
-
-## Alt: run it yourself as a container (Docker)
-
-A `Dockerfile` is included. Build and run, setting `DATA_DIR` to a persistent
-volume so conversation history survives restarts. Example:
+A personal, always-on WhatsApp auto-replier that answers your messages as if a real
+human is texting. It runs on **your machine, your own model** — no monthly fees, no
+message limits, no third-party chat services, no business verification.
 
 ```
-docker build -t whatsapp-ai-bot .
-docker run -d --env-file .env -v whatsbot_data:/data whatsapp-ai-bot
+WhatsApp (your number)  ->  bridge/bridge.js (Baileys QR session)
+                         ->  chigos-ai local AI (llama)  ->  humanized reply back
 ```
 
-Or locally without Docker: `python bot.py` (see Setup above).
+## The journey (why the repo looks the way it does)
 
-Keep `data/conversations.json` in git out (it contains chat history) — add a
-`.gitignore` with `.env` and `data/` if you commit this to GitHub.
+This project went through three approaches. The current one is the winner.
+
+1. **GreenAPI + Gemini** (`bot.py`, oldest) — a third-party WhatsApp service
+   (session-based, cloud). Abandoned: provider-imposed limits (trial caps,
+   throttling, paid tiers).
+2. **Meta WhatsApp Cloud API** (`worker.js`, `wrangler.toml`) — Meta's official API
+   via a free Cloudflare Worker. Abandoned: it legally requires a **registered
+   business** + business verification. For a personal number with no business, it is
+   a dead end. Worker is still deployed at `wa-bot.saintchigos.workers.dev` but is
+   deprecated.
+3. **Own bridge + local llama (current)** — see below.
+
+## Current recommended path: `bridge/`
+
+`bridge/bridge.js` is a self-hosted WhatsApp client (Baileys) that links your
+existing WhatsApp number the same way WhatsApp Web does — by **scanning a QR code**
+once. No third party is in the loop: messages go straight to your local AI and the
+reply goes straight back to WhatsApp.
+
+### Why it feels human
+
+- Types before replying (WhatsApp "typing…" indicator is shown)
+- Natural thinking + typing delay (no instant robot responses)
+- Long replies are sent in natural short chunks, like a real texter
+- Human persona prompt (casual, warm, matches the sender's language, never
+  reveals it is a bot)
+
+### How it works
+
+1. Baileys connects to your WhatsApp number (QR link, saved session).
+2. Each incoming message is skipped unless it's a normal text/caption chat
+   (groups and groups-ignore are off by default).
+3. The message is sent to the brain:
+   - **chigos-ai agent server** (`http://localhost:8000`) if it's running — full
+     agents + memory + tools, or
+   - the **raw local llama** (`http://localhost:8080/v1`, OpenAI-compatible) as a
+     fallback — e.g. chigos-ai's `local_server.py` / llama-cpp-python.
+4. The reply is humanized and sent back; per-contact history is kept.
+
+### Run it
+
+```bat
+cd bridge
+npm install
+node bridge.js
+```
+
+Then on your phone: **WhatsApp → Settings → Linked devices → Link a device** and
+scan the QR printed in the terminal. Keep the terminal window open — while it's
+running, messages get answered.
+
+> The local model must also be running. Minimum: the llama server on
+> `http://127.0.0.1:8080/v1` (e.g. from chigos-ai: `python local_server.py`).
+> For the full chigos-ai agents instead of the raw model, also run chigos-ai's
+> server so `http://localhost:8000/api/status` responds.
+
+### Configuration (`bridge/.env`, copy from `.env.example`)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CHIGOS_API_URL` | `http://127.0.0.1:8000` | chigos-ai agent server (used when reachable) |
+| `CHIGOS_MASTER_CODE` | `@T16i11n20k06` | master code for chigos-ai `/api/auth` |
+| `LLAMA_URL` | `http://127.0.0.1:8080/v1` | raw local llama fallback brain |
+| `BOT_PERSONA` | (built-in) | the "human" personality prompt |
+| `IGNORE_GROUPS` | `true` | don't auto-reply in group chats |
+| `MAX_HISTORY` | `12` | how many past turns the brain sees |
+| `SESSION_DIR` | `bridge/session` | where the WhatsApp QR session is saved |
+
+## Alternatives still in the repo
+
+### `bot.py` — GreenAPI client (path #1)
+
+Python bot that polls **GreenAPI** notifications and replies. It has been re-wired
+to use the local llama instead of Gemini (`LLAMA_SERVER` / `LOCAL_MODEL` in `.env`),
+so it can serve as a plain local-AI test harness. Not the recommended path — it
+needs a GreenAPI instance and still hits third-party limits.
+
+### `worker.js` — Meta Cloud API (path #2)
+
+Cloudflare Worker that receives Meta WhatsApp webhooks and replies via the Graph
+API. Fully built and the webhook verification works, **but it is unusable without
+a business registered with Meta**, so it's deprecated. Kept for reference.
 
 ## Notes
 
-- Using your personal WhatsApp number with third-party bridges like GreenAPI
-  violates WhatsApp's terms and carries a ban risk. You chose this route.
-- The AI persona is fully configurable via `AI_PERSONA` in `.env`.
+- The QR link is a "linked device" on your own WhatsApp account — your number stays
+  yours, and nothing is hosted on any third party.
+- Personal-use self-hosting: understand that running an unofficial WhatsApp client
+  is against WhatsApp's terms and carries a risk of your number being flagged. Use
+  with a number you can afford to lose. (This is also exactly why the official Meta
+  API exists — but that needs a real business.)
+- No secrets live in this repo. Real credentials go in your local `.env` / Cloudflare
+  secrets / `bridge/session`.

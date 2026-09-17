@@ -8,8 +8,8 @@ import requests
 
 ID_INSTANCE = os.environ.get("GREEN_API_ID_INSTANCE", "").strip()
 API_TOKEN = os.environ.get("GREEN_API_TOKEN", "").strip()
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip()
+LLAMA_SERVER = os.environ.get("LLAMA_SERVER", "http://127.0.0.1:8080/v1").strip()
+LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "Qwen2.5-1.5B-Instruct").strip()
 AI_PERSONA = os.environ.get(
     "AI_PERSONA",
     "You are a friendly personal assistant who replies to WhatsApp messages "
@@ -76,22 +76,29 @@ def send_message(chat_id, text):
 
 def ai_reply(history):
     system = f"{AI_PERSONA}\nLanguage/region: {AI_LOCALE}"
-    lines = [system, ""]
+    messages = [{"role": "system", "content": system}]
     for turn in history[-MAX_HISTORY:]:
-        who = "Human" if turn["role"] == "user" else "Assistant"
-        lines.append(f"{who}: {turn['text']}")
-    lines.append("Assistant:")
+        role = "user" if turn["role"] == "user" else "assistant"
+        messages.append({"role": role, "content": turn["text"]})
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    model = LOCAL_MODEL
+    try:
+        r = requests.get(f"{LLAMA_SERVER}/models", timeout=10)
+        if r.status_code == 200 and r.json().get("data"):
+            model = r.json()["data"][0]["id"]
+    except (requests.RequestException, KeyError, IndexError, TypeError):
+        pass
+
     payload = {
-        "contents": [{"parts": [{"text": "\n".join(lines)}]}],
-        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 400},
+        "model": model,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": 400,
     }
     try:
-        r = requests.post(url, params={"key": GEMINI_API_KEY}, json=payload, timeout=60)
+        r = requests.post(f"{LLAMA_SERVER}/chat/completions", json=payload, timeout=120)
         r.raise_for_status()
-        data = r.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        text = r.json()["choices"][0]["message"]["content"].strip()
         return text or None
     except (requests.RequestException, KeyError, IndexError, TypeError):
         return None
@@ -115,15 +122,14 @@ def handle_message(chat_id, text, conversations):
 
 
 def main():
-    if not (ID_INSTANCE and API_TOKEN and GEMINI_API_KEY):
+    if not (ID_INSTANCE and API_TOKEN):
         print(
-            "Missing config. Set GREEN_API_ID_INSTANCE, GREEN_API_TOKEN and "
-            "GEMINI_API_KEY in .env",
+            "Missing config. Set GREEN_API_ID_INSTANCE and GREEN_API_TOKEN in .env",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    print(f"Starting WhatsApp AI bot ({GEMINI_MODEL})...")
+    print(f"Starting WhatsApp AI bot (local llama @ {LLAMA_SERVER})...")
     conversations = load_conversations()
     last_error = None
 
